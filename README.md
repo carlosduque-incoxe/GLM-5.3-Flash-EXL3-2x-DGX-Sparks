@@ -1,5 +1,9 @@
 <h1 align="center">GLM-5.3 Flash EXL3 for 2-4x DGX Sparks</h1>
 
+> **Experimental four-Spark switchless fork:** [preparation, image and rollback guide (Spanish)](docs/SWITCHLESS-ES.md).
+> Opt-in `.env.tp4.ring.example`; CPU contract tests pass, hardware validation pending.
+> The upstream benchmarks below are not measurements of this switchless fork.
+
 <p align="center">
   <sub>by <a href="https://x.com/MiaAI_lab">Mia'a AI Lab</a></sub>
   <br><br>

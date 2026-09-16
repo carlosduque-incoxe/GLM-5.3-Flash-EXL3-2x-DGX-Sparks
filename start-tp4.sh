@@ -37,6 +37,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$SCRIPT_DIR/files/switchless-ring.sh"
 
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     [ -f "$SCRIPT_DIR/.env.example" ] || {
@@ -662,6 +663,7 @@ preflight() {
     # rank ~60 s in with ibv_modify_qp errno 61 "No data available". The index is
     # per-NIC, so validate head and worker separately: some pairs share one good
     # index, others need different ones (HEAD_GID / WORKER_GID).
+    if [[ ${NCCL_SWITCHLESS_RING_ONLY:-0} != 1 ]]; then
     local gid_head gid_worker gid_path ib r ssh_t gid_ok=1
     ib="$(_tp4_first_ib "$HEAD_CX7_IB")"
     gid_path="/sys/class/infiniband/${ib}/ports/1/gids/${HEAD_GID}"
@@ -691,6 +693,7 @@ preflight() {
         die "set NCCL_IB_GID_INDEX (same index both ranks) or HEAD_GID/WORKER_GID (per rank) in .env to populated indices"
     fi
 
+    fi # ring mode uses the stricter all-HCA preflight instead
     [ "$TP" = "4" ] || warn "TP=${TP} — expected TP=4 for start-tp4.sh"
     [ "$NNODES" = "4" ] || warn "NNODES=${NNODES} — expected 4"
 
@@ -1393,6 +1396,8 @@ _tp4_scp_runtime() {
 }
 
 launch_cluster() {
+    # Fail on ANY rank before removing containers; never replace an active GPU workload.
+    ring_preflight_all 1 || die "switchless preflight failed; no containers replaced"
     local r
     docker rm -f "$CONTAINER_HEAD" >/dev/null 2>&1 || true
     for r in 1 2 3; do
@@ -1479,14 +1484,18 @@ TP4_SKIP_OLD_SCP
         )
         log "NCCL channels pinned MIN=MAX=${NCCL_NCHANNELS} (all ranks)"
     fi
-    local worker_nccl="" e
+    ring_env_args nccl_common
+    local worker_nccl="" e quoted
     for e in "${nccl_common[@]}"; do
         [ "$e" = "-e" ] && continue
-        worker_nccl+=" -e $e"
+        printf -v quoted '%q' "$e"
+        worker_nccl+=" -e $quoted"
     done
 
     local -a head_preload=()
-    if [ "$USE_HOST_NCCL" = "1" ]; then
+    if [[ ${NCCL_SWITCHLESS_RING_ONLY:-0} == 1 ]]; then
+        head_preload=(-v "$NCCL_HOST_DIR/$NCCL_SO_NAME:${RING_MOUNT_PATHS[0]}:ro")
+    elif [ "$USE_HOST_NCCL" = "1" ]; then
         if [ -f "$NCCL_HOST_DIR/$NCCL_SO_NAME" ]; then
             head_preload=(-v "$NCCL_HOST_DIR:/nccl:ro" -e "LD_PRELOAD=/nccl/$NCCL_SO_NAME")
             log "head: LD_PRELOAD $NCCL_SO_NAME"
@@ -1516,7 +1525,10 @@ TP4_SKIP_OLD_SCP
     local worker_preload="" nccl_dir cname
     for r in 1 2 3; do
         worker_preload=""
-        if [ "$USE_HOST_NCCL" = "1" ]; then
+        if [[ ${NCCL_SWITCHLESS_RING_ONLY:-0} == 1 ]]; then
+            nccl_dir="$(_tp4_rank_nccl_dir "$r")"
+            printf -v worker_preload '%q %q' -v "$nccl_dir/$NCCL_SO_NAME:${RING_MOUNT_PATHS[$r]}:ro"
+        elif [ "$USE_HOST_NCCL" = "1" ]; then
             nccl_dir="$(_tp4_rank_nccl_dir "$r")"
             if worker_ssh_n "$r" "test -f '$nccl_dir/$NCCL_SO_NAME'"; then
                 worker_preload="-v '$nccl_dir:/nccl:ro' -e LD_PRELOAD='/nccl/$NCCL_SO_NAME'"
@@ -1756,8 +1768,11 @@ on_ready() {
 
 # ------------------------------- start -------------------------------------
 start() {
+    ring_validate || die "invalid switchless configuration"
     preflight
+    ring_preflight_all 1 || die "ring preparation incomplete; load images and free GPUs first"
     ensure_image
+    ring_preflight_all 1 || die "switchless preflight failed before weight preparation"
     download_weights
     download_dflash
     sync_weights
@@ -1855,7 +1870,12 @@ main() {
         start)    shift || true; start ;;
         download) download_only ;;
         stop)     stop ;;
-        restart)  stop; start ;;
+        restart)
+            [[ ${NCCL_SWITCHLESS_RING_ONLY:-0} != 1 ]] || die "For ring: run doctor-ring, then explicitly stop/start during maintenance"
+            stop; start ;;
+        doctor-ring)
+            [[ ${NCCL_SWITCHLESS_RING_ONLY:-0} == 1 ]] || die "Enable NCCL_SWITCHLESS_RING_ONLY=1 first"
+            ring_preflight_all 0 || die "switchless preflight failed" ;;
         status)   status ;;
         logs)     shift || true; logs "$@" ;;
         -h|--help|help) usage ;;
